@@ -195,6 +195,7 @@ def jellyfin(
             items = _items(base, {
                 "IncludeItemTypes": "BoxSet", "Recursive": "true",
                 "SortBy":           "SortName",
+                "Limit":            lim, "StartIndex": off,
             })
             return json.dumps([{"name": b.get("Name"), "id": b.get("Id")} for b in items])
 
