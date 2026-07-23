@@ -23,6 +23,15 @@ _ssl_verify = _ssl_verify if _ssl_verify else False if JELLYFIN_URL.startswith("
 
 mcp = FastMCP("jellyfin", host="0.0.0.0", port=int(os.environ.get("MCP_PORT", "8000")))
 
+# Tool annotations (hints; a client MAY use readOnlyHint/destructive to decide
+# whether to prompt). Version-safe: omitted if this mcp build lacks the type.
+try:
+    from mcp.types import ToolAnnotations
+    _READ_ANN = {"annotations": ToolAnnotations(readOnlyHint=True)}
+    _WRITE_ANN = {"annotations": ToolAnnotations(readOnlyHint=False, idempotentHint=True)}
+except Exception:
+    _READ_ANN, _WRITE_ANN = {}, {}
+
 # --- low-level HTTP -------------------------------------------------------
 
 def _request(method: str, path: str, params: dict | None = None):
@@ -71,8 +80,13 @@ def _user_id(name: str | None = None) -> str:
     raise ValueError(f"No Jellyfin user named {name!r}")
 
 
-def _find_movie(uid: str, title: str, year: int | None = None) -> dict | None:
-    """Best library match for title (opt. year). Client-side match like the Elisp version."""
+def _find_movie(uid: str, title: str, year: int | None = None):
+    """Best library match for title (opt. year), client-side.
+
+    Returns (item, match) where match is "exact" or "fuzzy"; (None, None) if the
+    library search returned nothing. A "fuzzy" result is only the top relevance
+    hit and MUST NOT be treated as confirmed ownership by callers.
+    """
     items = _items(
         f"/Users/{uid}/Items",
         {
@@ -87,12 +101,14 @@ def _find_movie(uid: str, title: str, year: int | None = None) -> dict | None:
     def norm(s):
         return (s or "").strip().lower()
 
-    # exact name match (with optional year)
+    # exact (normalized) name match, with optional year — the only confident case
     for it in items:
         if norm(it.get("Name")) == norm(title) and (year is None or it.get("ProductionYear") == year):
-            return it
-    # else top (relevance-ranked) hit
-    return items[0] if items else None
+            return it, "exact"
+    # no exact match: expose the top hit ONLY as a fuzzy candidate (never as owned)
+    if items:
+        return items[0], "fuzzy"
+    return None, None
 
 
 def _boxset_id(uid: str, name: str) -> str:
@@ -112,7 +128,7 @@ def _boxset_id(uid: str, name: str) -> str:
 
 # --- tool: jellyfin (read-only) -------------------------------------------
 
-@mcp.tool()
+@mcp.tool(**_READ_ANN)
 def jellyfin(
     op: str,
     user: Optional[str] = None,
@@ -123,25 +139,39 @@ def jellyfin(
     year: Optional[int] = None,
     offset: Optional[int] = None,
 ) -> str:
-    """Read my Jellyfin movie library (read-only). Ops:
+    """Read my Jellyfin movie library (read-only). Pick exactly one op.
+
+    Ops:
     - favorites: my hearted movies (taste signal)
-    - recent: my most-recently-watched movies, newest first
+    - recent: my most-recently-watched, newest first
     - unwatched: movies I own but have not watched (optional genre filter)
-    - lookup: is a given movie in my library? watched? favorite?
-    - collections: list my collections
-    - collection_movies: the movies inside a named collection
-    - in_collection: which collection(s) contain a given movie
-    Rows carry title, year, genres, imdb/tmdb ids, and watched/favorite flags.
+    - lookup: is ONE specific movie in my library? watched? favorite? (needs title)
+    - collections: list my collections (name + id)
+    - collection_movies: movies inside a named collection (needs collection)
+    - in_collection: which collection(s) contain a movie (needs title)
+
+    Returns JSON. List ops -> array of {title, year, genres, imdb, tmdb, id,
+    watched, favorite}. `lookup` returns one of:
+      {"in_library": true,  "match": "exact", ...movie fields}   -> owned, confirmed.
+      {"in_library": false, "match": "fuzzy", "candidate": {...}, "note": ...}
+          -> NO exact title match. `candidate` is the closest library title; do NOT
+             treat it as owned. To confirm, re-call lookup with the candidate's exact
+             title + year.
+      {"in_library": false, "match": null}   -> nothing close in the library.
+    `in_collection` similarly tags "match": "exact"|"fuzzy" (verify a fuzzy result).
+
+    Paging (list ops): `limit` (default 50) + `offset` (0-based); advance `offset`
+    by `limit` to fetch the next page.
 
     Args:
         op: favorites | recent | unwatched | lookup | collections | collection_movies | in_collection
         user: account name; defaults to mine
         title: movie title (required for lookup / in_collection)
-        collection: collection name: to list its movies (collection_movies) or to check membership (in_collection; omit to scan all)
-        genre: genre filter for unwatched, e.g. Comedy
-        limit: max movies for list ops
+        collection: collection name — to list its movies (collection_movies) or check membership (in_collection; omit to scan all)
+        genre: Jellyfin genre NAME to filter `unwatched`, e.g. "Action" (omit for no filter). This is a genre name — NOT a numeric id
+        limit: max movies for a list op (default 50)
         year: release year to disambiguate lookup / in_collection
-        offset: 0-based start index for paging list ops; use with limit to fetch the next page
+        offset: 0-based start index for paging list ops; advance it to fetch the next page
     """
     try:
         uid  = _user_id(user)
@@ -183,13 +213,22 @@ def jellyfin(
         elif op == "lookup":
             if not title:
                 raise ValueError("lookup needs a title")
-            it = _find_movie(uid, title, year)
-            if it:
-                result = {"in_library": True}
+            it, match = _find_movie(uid, title, year)
+            if it and match == "exact":
+                result = {"in_library": True, "match": "exact"}
                 result.update(_shape(it))
                 return json.dumps(result)
+            elif it:  # fuzzy: never assert ownership; surface an unconfirmed candidate
+                return json.dumps({
+                    "in_library": False,
+                    "match": "fuzzy",
+                    "query": {"title": title, "year": year},
+                    "candidate": _shape(it),
+                    "note": "no exact title match; closest library title returned as a candidate "
+                            "— confirm before treating as owned",
+                })
             else:
-                return json.dumps({"in_library": False, "title": title, "year": year})
+                return json.dumps({"in_library": False, "match": None, "title": title, "year": year})
 
         elif op == "collections":
             items = _items(base, {
@@ -215,7 +254,7 @@ def jellyfin(
         elif op == "in_collection":
             if not title:
                 raise ValueError("in_collection needs a title")
-            it = _find_movie(uid, title, year)
+            it, match = _find_movie(uid, title, year)
             if not it:
                 raise ValueError(f"{title!r} is not in the library")
             mid = it["Id"]
@@ -233,7 +272,11 @@ def jellyfin(
                 })
                 if any(k.get("Id") == mid for k in kids):
                     in_list.append(b.get("Name"))
-            return json.dumps({"title": it.get("Name"), "in_collections": in_list})
+            out = {"title": it.get("Name"), "match": match, "in_collections": in_list}
+            if match == "fuzzy":
+                out["note"] = ("no exact title match; resolved to the closest library title "
+                               "— verify this is the intended film")
+            return json.dumps(out)
 
         else:
             raise ValueError(f"Unknown op {op!r}")
@@ -244,24 +287,37 @@ def jellyfin(
 
 # --- tool: jellyfin_collection_add (the one write exception) ---------------
 
-@mcp.tool()
+@mcp.tool(**_WRITE_ANN)
 def jellyfin_collection_add(
     title: str,
     collection: str,
+    year: Optional[int] = None,
 ) -> str:
     """Add an OWNED movie to an EXISTING Jellyfin collection. Add-only and reversible.
-    Refuses if the movie is not in the library, or if the collection name is missing or
-    ambiguous (it never creates collections). Use only when I explicitly ask to add a film.
+    The movie must match a library title EXACTLY (a fuzzy/near match is refused, never
+    guessed) and the collection must exist (it never creates collections). Use only when
+    I explicitly ask to add a film. Pass year to disambiguate same-title films.
+
+    Returns {"added", "year", "to"} on success, or {"error": ...}. On a non-exact
+    title the error names the closest library title, so you can re-call with that
+    exact title + year.
 
     Args:
-        title: movie to add (must already be in the library)
+        title: movie to add (must already be in the library; matched EXACTLY)
         collection: exact name of an existing collection
+        year: release year to disambiguate the title (recommended)
     """
     try:
         uid = _user_id()
-        it  = _find_movie(uid, title)
+        it, match = _find_movie(uid, title, year)
         if not it:
             raise ValueError(f"{title!r} is not in the library; cannot add it")
+        if match != "exact":
+            raise ValueError(
+                f"{title!r} did not exactly match a library title "
+                f"(closest: {it.get('Name')!r}, {it.get('ProductionYear')}); refusing to add. "
+                f"Re-issue with the exact title (and year) to confirm."
+            )
         mid = it["Id"]
         cid = _boxset_id(uid, collection)
         _request("POST", f"/Collections/{cid}/Items", {"ids": mid})
