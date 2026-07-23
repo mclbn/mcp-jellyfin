@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""Jellyfin MCP server — read-only library queries + one write (collection add).
-
-Port of jellyfin.el: same tool names, same arguments, same JSON output.
-"""
+"""Jellyfin MCP server — read-only library queries + two writes (collection add, favorite set)."""
 
 import json
 import os
@@ -11,7 +8,7 @@ from typing import Optional
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-# --- config (env vars mirror the Elisp defcustoms) -------------------------
+# --- config (env vars) -----------------------------------------------------
 
 JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "http://nas.local:8096")
 JELLYFIN_USER = os.environ.get("JELLYFIN_USER", "me")
@@ -51,7 +48,7 @@ def _items(path: str, params: dict | None = None) -> list:
     return resp.get("Items", []) if resp else []
 
 
-# --- shape (same minimal fields as Elisp `perso/jellyfin--shape`) -----------
+# --- shape (minimal fields returned for each item) -------------------------
 
 def _shape(item: dict) -> dict:
     pids = item.get("ProviderIds") or {}
@@ -325,6 +322,59 @@ def jellyfin_collection_add(
             "added": it.get("Name"),
             "year":  it.get("ProductionYear"),
             "to":    collection,
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# --- tool: jellyfin_favorite_set (write — the heart button) ----------------
+
+@mcp.tool(**_WRITE_ANN)
+def jellyfin_favorite_set(
+    title: str,
+    favorite: bool = True,
+    year: Optional[int] = None,
+) -> str:
+    """Set an OWNED movie's favorite (heart) state to an EXPLICIT value — favorite=True
+    hearts it, favorite=False removes the heart. This is NOT a toggle: it sets the state
+    you pass, so it is reversible and idempotent (setting the state it already has is a
+    no-op, never a flip). The movie must match a library title EXACTLY (a fuzzy/near
+    match is refused, never guessed). Use only when I explicitly ask to favorite or
+    un-favorite a film. Pass year to disambiguate same-title films.
+
+    `favorite` defaults to True (heart it); pass favorite=false to remove the heart. To
+    un-heart a movie you must pass favorite=false — calling with no favorite arg hearts
+    it. Favorited movies are what the read tool's `favorites` op returns.
+
+    Returns {"favorite", "title", "year"} reflecting the movie's state AFTER the call,
+    or {"error": ...}. On a non-exact title the error names the closest library title,
+    so you can re-call with that exact title + year.
+
+    Args:
+        title: movie to (un)favorite (must already be in the library; matched EXACTLY)
+        favorite: True to heart it (default), False to remove the heart
+        year: release year to disambiguate the title (recommended)
+    """
+    try:
+        uid = _user_id()
+        it, match = _find_movie(uid, title, year)
+        if not it:
+            raise ValueError(f"{title!r} is not in the library; cannot favorite it")
+        if match != "exact":
+            raise ValueError(
+                f"{title!r} did not exactly match a library title "
+                f"(closest: {it.get('Name')!r}, {it.get('ProductionYear')}); refusing to set favorite. "
+                f"Re-issue with the exact title (and year) to confirm."
+            )
+        mid    = it["Id"]
+        method = "POST" if favorite else "DELETE"
+        resp   = _request(method, f"/Users/{uid}/FavoriteItems/{mid}")
+        # Jellyfin returns a UserItemDataDto; trust its IsFavorite, else echo intent.
+        actual = bool((resp or {}).get("IsFavorite", favorite))
+        return json.dumps({
+            "favorite": actual,
+            "title":    it.get("Name"),
+            "year":     it.get("ProductionYear"),
         })
     except Exception as e:
         return json.dumps({"error": str(e)})
