@@ -15,6 +15,12 @@ JELLYFIN_USER = os.environ.get("JELLYFIN_USER", "me")
 JELLYFIN_DEFAULT_LIMIT = int(os.environ.get("JELLYFIN_DEFAULT_LIMIT", "50"))
 JELLYFIN_API_KEY = os.environ.get("JELLYFIN_API_KEY", "")
 
+# Bulk enumeration (the `all` op) pages server-side; these bound it so a wrong
+# server count or an ignored StartIndex can never spin forever.
+JELLYFIN_PAGE = int(os.environ.get("JELLYFIN_PAGE", "200"))          # rows per page
+JELLYFIN_MAX_PAGES = int(os.environ.get("JELLYFIN_MAX_PAGES", "500"))
+JELLYFIN_MAX_ITEMS = int(os.environ.get("JELLYFIN_MAX_ITEMS", "100000"))
+
 _ssl_verify = os.environ.get("JELLYFIN_SSL_VERIFY", "").lower()
 _ssl_verify = _ssl_verify if _ssl_verify else False if JELLYFIN_URL.startswith("http://") else True
 
@@ -48,6 +54,93 @@ def _items(path: str, params: dict | None = None) -> list:
     return resp.get("Items", []) if resp else []
 
 
+def _fetch_all(path: str, params: dict) -> tuple[list, Optional[int], bool]:
+    """Fetch EVERY row for a query by paging server-side.
+
+    Returns (items, total_claimed, consistent):
+      - items:         all rows gathered across pages
+      - total_claimed: Jellyfin's TotalRecordCount from the first page (or None)
+      - consistent:    True unless we gathered a different number of rows than the
+                       server claimed (e.g. it returned a short page early, a known
+                       Jellyfin count quirk) — the caller surfaces this rather than
+                       trusting a number it can't stand behind.
+
+    Terminates on the FIRST of: all rows gathered (>= total_claimed), a short or
+    empty page, or the page/item safety cap. So it CANNOT loop forever, even if the
+    server miscounts or ignores StartIndex.
+    """
+    collected: list = []
+    total: Optional[int] = None
+    start, pages = 0, 0
+    while True:
+        pages += 1
+        p = dict(params)
+        p.update({"Limit": str(JELLYFIN_PAGE), "StartIndex": str(start),
+                  "EnableTotalRecordCount": "true"})
+        resp = _request("GET", path, p) or {}
+        items = resp.get("Items", []) or []
+        if total is None:
+            total = resp.get("TotalRecordCount")
+        collected.extend(items)
+        if not items:                                   # ran out of rows
+            break
+        if len(items) < JELLYFIN_PAGE:                  # last (short) page
+            break
+        if total is not None and len(collected) >= total:
+            break
+        if pages >= JELLYFIN_MAX_PAGES or len(collected) >= JELLYFIN_MAX_ITEMS:
+            break
+        start += len(items)
+    consistent = (total is None) or (len(collected) == total)
+    return collected, total, consistent
+
+
+def _count_movies(uid: str, year: int | None = None, genre: str | None = None) -> dict:
+    """Count movies matching an optional year and/or genre.
+
+    Uses Jellyfin's TotalRecordCount, which is reliable for the `Years=`/`Genres=`
+    query filters (unlike the watched/favorite post-filters — hence `count` accepts
+    only these two axes). Verifies exactly when the whole result fits on one page;
+    for multi-page results it trusts the documented-reliable total but marks it
+    unverified. Never enumerates a large library just to count, and reports a
+    single-page count/rows mismatch instead of returning a number it can't back.
+    """
+    params = {
+        "IncludeItemTypes": "Movie", "Recursive": "true",
+        "EnableTotalRecordCount": "true",
+        "Limit": str(JELLYFIN_PAGE), "StartIndex": "0",
+    }
+    if year is not None:
+        params["Years"] = str(year)
+    if genre:
+        params["Genres"] = genre
+    resp = _request("GET", f"/Users/{uid}/Items", params) or {}
+    rows = len(resp.get("Items", []) or [])
+    total = resp.get("TotalRecordCount")
+
+    filters: dict = {}
+    if year is not None:
+        filters["year"] = year
+    if genre:
+        filters["genre"] = genre
+    out: dict = {"op": "count", "filters": filters}
+
+    if total is None:                                   # server gave no total
+        out.update({"count": rows, "verified": False,
+                    "note": "server reported no TotalRecordCount; count is the first page only"})
+    elif rows < JELLYFIN_PAGE:                          # whole result on one page
+        if total == rows:
+            out.update({"count": total, "verified": True})
+        else:                                           # claimed != actually returned
+            out.update({"count": rows, "total_claimed": total, "consistent": False,
+                        "note": "TotalRecordCount disagrees with the rows returned on a "
+                                "single page; reporting the rows actually seen"})
+    else:                                               # multi-page trusted total
+        out.update({"count": total, "verified": False,
+                    "note": "server total for a trusted filter (year/genre); not exhaustively enumerated"})
+    return out
+
+
 # --- shape (minimal fields returned for each item) -------------------------
 
 def _shape(item: dict) -> dict:
@@ -63,6 +156,13 @@ def _shape(item: dict) -> dict:
         "watched":  bool(ud.get("Played"))     if ud else False,
         "favorite": bool(ud.get("IsFavorite")) if ud else False,
     }
+
+
+def _shape_min(item: dict) -> dict:
+    """Compact projection of `_shape` for bulk enumeration: drops `tmdb` (redundant
+    once `imdb` is present) and `id`, to keep a whole-library dump small."""
+    s = _shape(item)
+    return {k: s[k] for k in ("title", "year", "genres", "imdb", "watched", "favorite")}
 
 
 # --- resolvers ------------------------------------------------------------
@@ -146,6 +246,18 @@ def jellyfin(
     - collections: list my collections (name + id)
     - collection_movies: movies inside a named collection (needs collection)
     - in_collection: which collection(s) contain a movie (needs title)
+    - all: my ENTIRE movie library — every owned film, gathered by server-side
+        auto-paging in ONE call (no manual limit/offset needed). Each movie has
+        {title, year, genres, imdb, watched, favorite}. Use this for
+        completeness / coverage questions that need the whole library —
+        distributions, "do I own any <language/country> films", listing
+        everything of a kind — and as the fallback for anything `count` can't do.
+        Prefer `count` when a plain number for a year/genre is all that's needed.
+    - count: HOW MANY movies match a year and/or genre, as an authoritative number
+        WITHOUT listing them (needs year and/or genre; omit both for the library
+        total). e.g. "how many 1985 films", "how many horror movies do I own".
+        Only year/genre are supported here because Jellyfin counts those reliably;
+        for watched/favorite counts use `all` (or favorites/unwatched) instead.
 
     Returns JSON. List ops -> array of {title, year, genres, imdb, tmdb, id,
     watched, favorite}. `lookup` returns one of:
@@ -161,14 +273,14 @@ def jellyfin(
     by `limit` to fetch the next page.
 
     Args:
-        op: favorites | recent | unwatched | lookup | collections | collection_movies | in_collection
+        op: favorites | recent | unwatched | lookup | collections | collection_movies | in_collection | all | count
         user: account name; defaults to mine
         title: movie title (required for lookup / in_collection)
         collection: collection name — to list its movies (collection_movies) or check membership (in_collection; omit to scan all)
-        genre: Jellyfin genre NAME to filter `unwatched`, e.g. "Action" (omit for no filter). This is a genre name — NOT a numeric id
-        limit: max movies for a list op (default 50)
-        year: release year to disambiguate lookup / in_collection
-        offset: 0-based start index for paging list ops; advance it to fetch the next page
+        genre: Jellyfin genre NAME to filter `unwatched` or `count`, e.g. "Action" (omit for no filter). This is a genre name — NOT a numeric id
+        limit: max movies for a list op (default 50); ignored by `all` (which fetches everything) and `count`
+        year: release year — disambiguates lookup / in_collection, and filters `count`
+        offset: 0-based start index for paging list ops; advance it to fetch the next page. Not needed for `all` (it pages internally)
     """
     try:
         uid  = _user_id(user)
@@ -274,6 +386,28 @@ def jellyfin(
                 out["note"] = ("no exact title match; resolved to the closest library title "
                                "— verify this is the intended film")
             return json.dumps(out)
+
+        elif op == "all":
+            movies, total, consistent = _fetch_all(base, {
+                "IncludeItemTypes": "Movie", "Recursive": "true",
+                "EnableUserData":   "true", "Fields": flds,
+                "SortBy":           "SortName",
+            })
+            out = {
+                "op":        "all",
+                "count":     len(movies),
+                "consistent": consistent,
+                "movies":    [_shape_min(m) for m in movies],
+            }
+            if not consistent:
+                out["total_claimed"] = total
+                out["note"] = ("stopped before reaching the server's claimed total "
+                               "(count/total mismatch); returning every row actually "
+                               "fetched — treat the set as possibly incomplete")
+            return json.dumps(out)
+
+        elif op == "count":
+            return json.dumps(_count_movies(uid, year, genre))
 
         else:
             raise ValueError(f"Unknown op {op!r}")
