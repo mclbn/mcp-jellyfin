@@ -3,6 +3,7 @@
 
 import json
 import os
+import datetime
 from typing import Optional
 
 import httpx
@@ -20,6 +21,7 @@ JELLYFIN_API_KEY = os.environ.get("JELLYFIN_API_KEY", "")
 JELLYFIN_PAGE = int(os.environ.get("JELLYFIN_PAGE", "200"))          # rows per page
 JELLYFIN_MAX_PAGES = int(os.environ.get("JELLYFIN_MAX_PAGES", "500"))
 JELLYFIN_MAX_ITEMS = int(os.environ.get("JELLYFIN_MAX_ITEMS", "100000"))
+JELLYFIN_YEAR_FLOOR = int(os.environ.get("JELLYFIN_YEAR_FLOOR", "1880"))  # floor for open-ended year ranges
 
 _ssl_verify = os.environ.get("JELLYFIN_SSL_VERIFY", "").lower()
 _ssl_verify = _ssl_verify if _ssl_verify else False if JELLYFIN_URL.startswith("http://") else True
@@ -95,49 +97,68 @@ def _fetch_all(path: str, params: dict) -> tuple[list, Optional[int], bool]:
     return collected, total, consistent
 
 
-def _count_movies(uid: str, year: int | None = None, genre: str | None = None) -> dict:
-    """Count movies matching an optional year and/or genre.
+def _count_movies(uid: str, year: int | None = None, genre: str | None = None,
+                  year_from: int | None = None, year_to: int | None = None) -> dict:
+    """Count movies matching an optional year (or year range) and/or genre.
 
     Uses Jellyfin's TotalRecordCount, which is reliable for the `Years=`/`Genres=`
     query filters (unlike the watched/favorite post-filters — hence `count` accepts
-    only these two axes). Verifies exactly when the whole result fits on one page;
-    for multi-page results it trusts the documented-reliable total but marks it
-    unverified. Never enumerates a large library just to count, and reports a
-    single-page count/rows mismatch instead of returning a number it can't back.
+    only these axes). A single `year` wins if given; otherwise `year_from`/`year_to`
+    define an INCLUSIVE range, expanded to a comma-list of years (Jellyfin has no
+    native range filter but accepts a comma-delimited `Years=` list, which keeps the
+    count on the trusted path). An open-ended range fills the missing bound
+    (floor = JELLYFIN_YEAR_FLOOR, ceiling = current year).
+
+    Verifies exactly when the whole result fits on one page; for multi-page results
+    it trusts the documented-reliable total. Never enumerates a large library just
+    to count, and reports a single-page count/rows mismatch instead of a number it
+    can't back.
     """
+    filters: dict = {}
+    years_param: str | None = None
+
+    if year is not None:                                # single year wins
+        years_param = str(year)
+        filters["year"] = year
+    elif year_from is not None or year_to is not None:  # inclusive range
+        lo = year_from if year_from is not None else JELLYFIN_YEAR_FLOOR
+        hi = year_to if year_to is not None else datetime.date.today().year
+        if lo > hi:
+            raise ValueError(f"year_from ({lo}) is after year_to ({hi})")
+        if hi - lo > 300:
+            raise ValueError(f"year range {lo}-{hi} is too wide")
+        years_param = ",".join(str(y) for y in range(lo, hi + 1))
+        filters["year_from"], filters["year_to"] = lo, hi   # echo effective bounds
+
     params = {
         "IncludeItemTypes": "Movie", "Recursive": "true",
         "EnableTotalRecordCount": "true",
         "Limit": str(JELLYFIN_PAGE), "StartIndex": "0",
     }
-    if year is not None:
-        params["Years"] = str(year)
+    if years_param is not None:
+        params["Years"] = years_param
     if genre:
         params["Genres"] = genre
+        filters["genre"] = genre
+
     resp = _request("GET", f"/Users/{uid}/Items", params) or {}
     rows = len(resp.get("Items", []) or [])
     total = resp.get("TotalRecordCount")
-
-    filters: dict = {}
-    if year is not None:
-        filters["year"] = year
-    if genre:
-        filters["genre"] = genre
     out: dict = {"op": "count", "filters": filters}
 
-    if total is None:                                   # server gave no total
-        out.update({"count": rows, "verified": False,
-                    "note": "server reported no TotalRecordCount; count is the first page only"})
-    elif rows < JELLYFIN_PAGE:                          # whole result on one page
-        if total == rows:
-            out.update({"count": total, "verified": True})
-        else:                                           # claimed != actually returned
-            out.update({"count": rows, "total_claimed": total, "consistent": False,
-                        "note": "TotalRecordCount disagrees with the rows returned on a "
-                                "single page; reporting the rows actually seen"})
-    else:                                               # multi-page trusted total
-        out.update({"count": total, "verified": False,
-                    "note": "server total for a trusted filter (year/genre); not exhaustively enumerated"})
+    # For the year/genre filters this tool accepts, Jellyfin's TotalRecordCount is
+    # reliable, so it simply IS the count. We add fields ONLY to raise a genuine
+    # problem; the absence of a warning means the number can be trusted as-is.
+    if total is None:                                   # server gave no total at all
+        out.update({"count": rows,
+                    "note": "server reported no total; count reflects the rows "
+                            "returned and may be incomplete"})
+    elif rows < JELLYFIN_PAGE and total != rows:        # whole set on one page, yet total disagrees
+        out.update({"count": rows, "total_claimed": total, "consistent": False,
+                    "note": "server's reported total disagrees with the rows it "
+                            "returned on a single page; reporting the rows actually seen"})
+    else:                                               # exact single-page match, or trusted multi-page total
+        out["count"] = total
     return out
 
 
@@ -235,6 +256,8 @@ def jellyfin(
     limit: Optional[int] = None,
     year: Optional[int] = None,
     offset: Optional[int] = None,
+    year_from: Optional[int] = None,
+    year_to: Optional[int] = None,
 ) -> str:
     """Read my Jellyfin movie library (read-only). Pick exactly one op.
 
@@ -256,8 +279,15 @@ def jellyfin(
     - count: HOW MANY movies match a year and/or genre, as an authoritative number
         WITHOUT listing them (needs year and/or genre; omit both for the library
         total). e.g. "how many 1985 films", "how many horror movies do I own".
-        Only year/genre are supported here because Jellyfin counts those reliably;
-        for watched/favorite counts use `all` (or favorites/unwatched) instead.
+        For a span (a decade, "between X and Y", "before/after YYYY") use
+        year_from/year_to (inclusive) INSTEAD of listing years or dumping `all` —
+        e.g. "horror films from the 80s" -> genre="Horror", year_from=1980,
+        year_to=1989 in ONE call. Only year/genre are supported here because
+        Jellyfin counts those reliably; for watched/favorite counts use `all`
+        (or favorites/unwatched) instead. The returned `count` is exact for these
+        filters — report it directly. The result carries an extra
+        `consistent:false`/`note` ONLY if the server gave an inconsistent answer;
+        if there is no such field, do not hedge the number.
 
     Returns JSON. List ops -> array of {title, year, genres, imdb, tmdb, id,
     watched, favorite}. `lookup` returns one of:
@@ -279,8 +309,10 @@ def jellyfin(
         collection: collection name — to list its movies (collection_movies) or check membership (in_collection; omit to scan all)
         genre: Jellyfin genre NAME to filter `unwatched` or `count`, e.g. "Action" (omit for no filter). This is a genre name — NOT a numeric id
         limit: max movies for a list op (default 50); ignored by `all` (which fetches everything) and `count`
-        year: release year — disambiguates lookup / in_collection, and filters `count`
+        year: release year — disambiguates lookup / in_collection, and filters `count` (a SINGLE year)
         offset: 0-based start index for paging list ops; advance it to fetch the next page. Not needed for `all` (it pages internally)
+        year_from: inclusive start year of a range for `count` (e.g. 1980 for "the 80s"); omit for an open start. Ignored if `year` is given
+        year_to: inclusive end year of a range for `count` (e.g. 1989 for "the 80s"); omit for an open end (defaults to the current year). Ignored if `year` is given
     """
     try:
         uid  = _user_id(user)
@@ -407,7 +439,7 @@ def jellyfin(
             return json.dumps(out)
 
         elif op == "count":
-            return json.dumps(_count_movies(uid, year, genre))
+            return json.dumps(_count_movies(uid, year, genre, year_from, year_to))
 
         else:
             raise ValueError(f"Unknown op {op!r}")
