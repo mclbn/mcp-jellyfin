@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Jellyfin MCP server — read-only library queries + two writes (collection add, favorite set)."""
+"""Jellyfin MCP server — read-only library queries + three writes (collection add, favorite set, watched set)."""
 
 import json
 import os
@@ -541,6 +541,60 @@ def jellyfin_favorite_set(
             "favorite": actual,
             "title":    it.get("Name"),
             "year":     it.get("ProductionYear"),
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# --- tool: jellyfin_watched_set (write — the played/watched flag) ----------
+
+@mcp.tool(**_WRITE_ANN)
+def jellyfin_watched_set(
+    title: str,
+    watched: bool = True,
+    year: Optional[int] = None,
+) -> str:
+    """Set an OWNED movie's watched (played) state to an EXPLICIT value — watched=True
+    marks it watched, watched=False marks it unwatched. This is NOT a toggle: it sets
+    the state you pass, so it is reversible and idempotent (setting the state it already
+    has is a no-op, never a flip). The movie must match a library title EXACTLY (a
+    fuzzy/near match is refused, never guessed). Use only when I explicitly ask to mark
+    a film watched or unwatched. Pass year to disambiguate same-title films.
+
+    `watched` defaults to True (mark it watched); pass watched=false to clear it. To
+    mark a movie unwatched you must pass watched=false — calling with no watched arg
+    marks it watched. Watched state is what the read tool's `recent` and `unwatched`
+    ops key off of.
+
+    Returns {"watched", "title", "year"} reflecting the movie's state AFTER the call,
+    or {"error": ...}. On a non-exact title the error names the closest library title,
+    so you can re-call with that exact title + year.
+
+    Args:
+        title: movie to mark (un)watched (must already be in the library; matched EXACTLY)
+        watched: True to mark watched (default), False to mark unwatched
+        year: release year to disambiguate the title (recommended)
+    """
+    try:
+        uid = _user_id()
+        it, match = _find_movie(uid, title, year)
+        if not it:
+            raise ValueError(f"{title!r} is not in the library; cannot mark it watched")
+        if match != "exact":
+            raise ValueError(
+                f"{title!r} did not exactly match a library title "
+                f"(closest: {it.get('Name')!r}, {it.get('ProductionYear')}); refusing to set watched. "
+                f"Re-issue with the exact title (and year) to confirm."
+            )
+        mid    = it["Id"]
+        method = "POST" if watched else "DELETE"
+        resp   = _request(method, f"/Users/{uid}/PlayedItems/{mid}")
+        # Jellyfin returns a UserItemDataDto; trust its Played, else echo intent.
+        actual = bool((resp or {}).get("Played", watched))
+        return json.dumps({
+            "watched": actual,
+            "title":   it.get("Name"),
+            "year":    it.get("ProductionYear"),
         })
     except Exception as e:
         return json.dumps({"error": str(e)})
